@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import ServiceManagement
 import UserNotifications
 
@@ -85,7 +86,7 @@ final class AutoReset: ObservableObject {
             guard let b = allBrowsers.first(where: { $0.id == id }), b.isInstalled else { continue }
             if !b.runningApps.isEmpty && !allowQuit { skipped.append(b.name); continue }
             do {
-                let r = try await Engine.reset(b, categories: categories)
+                let r = try await Engine.reset(b, categories: categories, backup: BackupSettings.request(reason: "Scheduled reset"))
                 cleaned.append("\(b.name) (\(r.trashed))")
                 errors += r.failed
             } catch { errors.append(error.localizedDescription) }
@@ -101,7 +102,7 @@ final class AutoReset: ObservableObject {
         lastStatus = text
         guard notifyUser else { return }
         let c = UNMutableNotificationContent()
-        c.title = "Browser Reset"; c.body = text
+        c.title = "Pristine"; c.body = text
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
     }
 }
@@ -115,6 +116,20 @@ struct MenuContent: View {
     @AppStorage(Key.browserIDs) private var browserRaw = ""
 
     private var categories: Set<DataCategory> { Set(parse(catRaw).compactMap(DataCategory.init(rawValue:))) }
+
+    private func confirmEmptyTrash() {
+        let info = TrashTool.size()
+        let alert = NSAlert()
+        alert.messageText = info.count == 0 ? "The Trash is already empty." : "Empty the Trash?"
+        alert.informativeText = info.count == 0
+            ? "There's nothing to remove."
+            : "This permanently deletes \(info.count) item(s). This cannot be undone."
+        alert.addButton(withTitle: info.count == 0 ? "OK" : "Empty Trash")
+        if info.count > 0 { alert.addButton(withTitle: "Cancel") }
+        NSApp.activate(ignoringOtherApps: true)
+        guard info.count > 0, alert.runModal() == .alertFirstButtonReturn else { return }
+        _ = TrashTool.empty()
+    }
 
     private func confirmAndRun(_ browsers: [Browser]) {
         guard !browsers.isEmpty else { return }
@@ -139,7 +154,13 @@ struct MenuContent: View {
         Text(auto.lastStatus)
         Divider()
         Button("Open Full Window") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+        Button("Find Large Files…") { openWindow(id: "largefiles"); NSApp.activate(ignoringOtherApps: true) }
+        Button("Backups…") { openWindow(id: "backups"); NSApp.activate(ignoringOtherApps: true) }
+        Button("Unused Apps…") { openWindow(id: "unusedapps"); NSApp.activate(ignoringOtherApps: true) }
+        Button("Activity Monitor…") { openWindow(id: "activity"); NSApp.activate(ignoringOtherApps: true) }
+        Button("Empty Trash…") { confirmEmptyTrash() }
         Button("Schedule & Settings…") { openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
+        Button("Support PcMac ♥…") { Branding.openSupportPage() }
         Divider()
         Button("Quit") { NSApp.terminate(nil) }
     }
@@ -182,7 +203,7 @@ struct SettingsView: View {
                     Text("Daily at a set time").tag("daily")
                     Text("Every N hours").tag("interval")
                 }
-                .onChange(of: mode) { _ in
+                .onChange(of: mode) { _, _ in
                     // Start the clock now so enabling a schedule doesn't trigger an instant reset.
                     UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Key.lastRun)
                 }
@@ -205,11 +226,29 @@ struct SettingsView: View {
             }
             Section("General") {
                 Toggle("Launch at login", isOn: $launchAtLogin)
-                    .onChange(of: launchAtLogin) { on in
+                    .onChange(of: launchAtLogin) { _, on in
                         do { if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }
                         catch { launchAtLogin = SMAppService.mainApp.status == .enabled }
                     }
                 Text(auto.lastStatus).font(.caption).foregroundStyle(.secondary)
+            }
+            Section("About") {
+                HStack(spacing: 12) {
+                    LogoView(height: 48)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Made by \(Branding.creatorName)").font(.callout.weight(.semibold))
+                        Text("Enjoying the app? You can support my work with a small tip.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        Branding.openSupportPage()
+                    } label: {
+                        Label("Donate", systemImage: "heart.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.pink)
+                }
             }
         }
         .formStyle(.grouped)

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 // MARK: - Model
 
@@ -8,6 +9,7 @@ enum DataCategory: String, CaseIterable, Identifiable {
     case cookies = "Cookies"
     case cache = "Cache"
     case siteData = "Site data (local storage, IndexedDB)"
+    case sessions = "Open tabs"
     var id: String { rawValue }
 }
 
@@ -47,6 +49,8 @@ private func chromium(id: String, name: String, support: String, cache: String) 
             return [lib("Caches/\(cache)")] + profiles.flatMap { p in ["Cache", "Code Cache", "GPUCache"].map { p.appendingPathComponent($0) } }
         case .siteData:
             return profiles.flatMap { p in ["Local Storage", "IndexedDB", "Session Storage", "Service Worker"].map { p.appendingPathComponent($0) } }
+        case .sessions:
+            return profiles.flatMap { p in ["Sessions", "Current Session", "Current Tabs", "Last Session", "Last Tabs"].map { p.appendingPathComponent($0) } }
         }
     }
 }
@@ -63,6 +67,9 @@ let allBrowsers: [Browser] = [
             return [lib("Caches/com.apple.Safari"), lib("\(c)/Caches")]
         case .siteData:
             return [lib("Safari/LocalStorage"), lib("WebKit/com.apple.Safari"), lib("\(c)/WebKit")]
+        case .sessions:
+            return [lib("Safari/LastSession.plist"), lib("\(c)/Safari/LastSession.plist"),
+                    lib("Saved Application State/com.apple.Safari.savedState")]
         }
     },
     chromium(id: "com.google.Chrome", name: "Google Chrome", support: "Google/Chrome", cache: "Google/Chrome"),
@@ -77,6 +84,7 @@ let allBrowsers: [Browser] = [
         case .cookies:  return profiles.flatMap { p in ["cookies.sqlite", "cookies.sqlite-wal"].map { p.appendingPathComponent($0) } }
         case .cache:    return [lib("Caches/Firefox")]
         case .siteData: return profiles.map { $0.appendingPathComponent("storage") }
+        case .sessions: return profiles.flatMap { p in ["sessionstore.jsonlz4", "sessionstore-backups", "sessionCheckpoints.json"].map { p.appendingPathComponent($0) } }
         }
     }
 ]
@@ -85,12 +93,20 @@ let allBrowsers: [Browser] = [
 
 enum ResetError: LocalizedError {
     case couldNotQuit(String)
+    case backupFailed(String)
     var errorDescription: String? {
-        switch self { case .couldNotQuit(let n): return "\(n) would not quit. Close it manually and try again." }
+        switch self {
+        case .couldNotQuit(let n): return "\(n) would not quit. Close it manually and try again."
+        case .backupFailed(let why): return "Backup failed, so nothing was deleted. (\(why))"
+        }
     }
 }
 
-struct ResetResult { var trashed = 0; var failed: [String] = [] }
+struct ResetResult {
+    var trashed = 0
+    var failed: [String] = []
+    var backupFiles = 0          // items saved in the pre-reset backup (0 if none was made)
+}
 
 enum Engine {
     /// Reading ~/Library/Safari throws if Full Disk Access hasn't been granted.
@@ -124,9 +140,21 @@ enum Engine {
     }
 
     /// Moves files to the Trash (recoverable) rather than deleting them.
-    static func reset(_ browser: Browser, categories: Set<DataCategory>) async throws -> ResetResult {
+    /// Order of operations: close the browser, back up (if requested), then move files to the Trash.
+    /// If the backup fails the reset is aborted before anything is touched.
+    static func reset(_ browser: Browser, categories: Set<DataCategory>, backup: BackupRequest? = nil) async throws -> ResetResult {
         try await quit(browser)
         var result = ResetResult()
+        if let backup {
+            do {
+                let record = try await BackupEngine.create(browserID: browser.id, browserName: browser.name,
+                                                           items: backup.items, root: backup.folder,
+                                                           reason: backup.reason, keep: backup.keep)
+                result.backupFiles = record?.manifest.files.count ?? 0
+            } catch {
+                throw ResetError.backupFailed(error.localizedDescription)
+            }
+        }
         for url in paths(for: browser, categories: categories) {
             do {
                 try FileManager.default.trashItem(at: url, resultingItemURL: nil)
@@ -139,87 +167,6 @@ enum Engine {
     }
 }
 
-// MARK: - UI
-
-@MainActor
-final class ViewModel: ObservableObject {
-    @Published var browsers = allBrowsers.filter(\.isInstalled)
-    @Published var selectedID: String?
-    @Published var categories: Set<DataCategory> = [.history, .cookies, .cache]
-    @Published var hasAccess = Engine.hasFullDiskAccess()
-    @Published var status = ""
-    @Published var busy = false
-    @Published var showConfirm = false
-
-    var selected: Browser? { browsers.first { $0.id == selectedID } }
-    var preview: [URL] { selected.map { Engine.paths(for: $0, categories: categories) } ?? [] }
-
-    func refreshAccess() { hasAccess = Engine.hasFullDiskAccess() }
-
-    func reset() {
-        guard let b = selected else { return }
-        busy = true; status = "Closing \(b.name)…"
-        Task {
-            do {
-                let r = try await Engine.reset(b, categories: categories)
-                status = "Done. \(r.trashed) item(s) moved to the Trash." + (r.failed.isEmpty ? "" : " Failed: \(r.failed.joined(separator: "; "))")
-            } catch { status = error.localizedDescription }
-            busy = false
-        }
-    }
-}
-
-struct ContentView: View {
-    @StateObject private var vm = ViewModel()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Browser Reset").font(.title2.bold())
-
-            if !vm.hasAccess {
-                HStack {
-                    Text("Full Disk Access is required to clear Safari and other browser data.")
-                    Spacer()
-                    Button("Open Settings") { Engine.openFullDiskAccessSettings() }
-                    Button("Recheck") { vm.refreshAccess() }
-                }
-                .padding(10).background(.yellow.opacity(0.2)).cornerRadius(8)
-            }
-
-            Picker("Browser", selection: $vm.selectedID) {
-                Text("Choose…").tag(String?.none)
-                ForEach(vm.browsers) { Text($0.name).tag(Optional($0.id)) }
-            }
-
-            VStack(alignment: .leading) {
-                ForEach(DataCategory.allCases) { cat in
-                    Toggle(cat.rawValue, isOn: Binding(
-                        get: { vm.categories.contains(cat) },
-                        set: { on in if on { vm.categories.insert(cat) } else { vm.categories.remove(cat) } }))
-                }
-            }
-
-            Text("\(vm.preview.count) item(s) will be moved to the Trash").foregroundStyle(.secondary)
-            List(vm.preview, id: \.self) { Text($0.path).font(.caption.monospaced()) }
-                .frame(minHeight: 120)
-
-            HStack {
-                Button("Reset…", role: .destructive) { vm.showConfirm = true }
-                    .disabled(vm.selected == nil || vm.preview.isEmpty || vm.busy || !vm.hasAccess)
-                if vm.busy { ProgressView().controlSize(.small) }
-                Text(vm.status).foregroundStyle(.secondary)
-            }
-        }
-        .padding(20)
-        .frame(width: 560, height: 560)
-        .confirmationDialog("Reset \(vm.selected?.name ?? "browser")?", isPresented: $vm.showConfirm) {
-            Button("Quit browser and reset", role: .destructive) { vm.reset() }
-        } message: {
-            Text("The browser will be closed and the listed items moved to the Trash. Synced data may come back from the cloud.")
-        }
-    }
-}
-
 @main
 struct BrowserResetApp: App {
     @ObservedObject private var auto = AutoReset.shared
@@ -227,10 +174,19 @@ struct BrowserResetApp: App {
     init() { AutoReset.shared.start() }
 
     var body: some Scene {
-        MenuBarExtra("Browser Reset", systemImage: "arrow.counterclockwise.circle") {
+        MenuBarExtra("Pristine", systemImage: "arrow.counterclockwise.circle") {
             MenuContent(auto: auto)
         }
-        Window("Browser Reset", id: "main") { ContentView() }
+        Window("Pristine", id: "main") { ContentView() }
+            .windowResizability(.contentSize)
         Window("Schedule & Settings", id: "settings") { SettingsView(auto: auto) }
+        Window("Large Files & Trash", id: "largefiles") { LargeFilesView() }
+            .windowResizability(.contentSize)
+        Window("Backups", id: "backups") { BackupsView() }
+            .windowResizability(.contentSize)
+        Window("Activity Monitor", id: "activity") { ActivityMonitorView() }
+            .windowResizability(.contentSize)
+        Window("Unused Apps", id: "unusedapps") { UnusedAppsView() }
+            .windowResizability(.contentSize)
     }
 }
