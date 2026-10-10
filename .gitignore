@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcarchive
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Release output
+dist/
+
+# Keep shared schemes so `xcodebuild -scheme` works for everyone
+!*.xcodeproj/xcshareddata/
